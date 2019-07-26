@@ -16,7 +16,7 @@ from unidecode import unidecode
 
 try:
     import queue
-    from urllib.parse import urljoin
+    from urllib.parse import urlparse
     q = queue.Queue()
 except ImportError:
     from Queue import Queue
@@ -29,13 +29,18 @@ blogs = set()
 domain_list = []
 first = ''
 last = ''
+start_time = None
+# external_domain_limit = 500
+external_domain_limit = 1000
+blog_limit = 4000
+thread_limit_numbers = 20
 
 headers = {
     'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36',
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3',
 }
 
-f = open('blog_urls.csv', 'w')
+f = open('domain_list.csv', 'w')
 csv_writer = csv.writer(f)
 
 def parse(url):
@@ -47,24 +52,29 @@ def parse(url):
     print ('parse function start', url)
     root_url = url
     try:
-        r = requests.get(url, headers=headers)
+        r = requests.get(url, headers=headers, allow_redirects=True)
         sub_sitexml_list = re.findall("<loc>(.*?)</loc>", r.text)
-        # print(len(sub_sitexml_list))
+
         if len(sub_sitexml_list) > 0:
             if  '.xml' in sub_sitexml_list[0]:
-                threads = []
-                for sub_url in sub_sitexml_list:
-                    # csv_writer.writerow([sub_url])
-                    # f.flush()
-                    if check_sub_xml(sub_url):
-                        t = threading.Thread(target=parse, args=(sub_url.replace('&amp;','&').replace('<![CDATA[','').replace(']]>',''),))
-                        t.daemon = True
-                        threads.append(t)
-                        t.start()
-                        sleep(1)
-                
-                for t in threads:
-                    t.join()
+                parse_threads = []
+                print('------------ Start Thread ------------', len(sub_sitexml_list))
+                while len(sub_sitexml_list) > 0:
+                    
+                    if len(parse_threads) < thread_limit_numbers:
+                        sub_url = sub_sitexml_list.pop(0)
+                        print('----- THREAD ----', len(parse_threads), check_sub_xml(sub_url))
+                        if check_sub_xml(sub_url):
+                            t = threading.Thread(target=parse, args=(sub_url.replace('&amp;','&').replace('<![CDATA[','').replace(']]>',''),))
+                            t.daemon = True
+                            parse_threads.append(t)
+                            t.start()
+
+                    for thread in parse_threads:
+                        if not thread.is_alive():
+                            thread.join()
+                            parse_threads.remove(thread)
+                            print("Remain parse_threads -> {}".format(len(parse_threads)))
             else:
                 re_date_list = re.findall("<lastmod>(.*?)</lastmod>", r.text)
                 html_ = unidecode(r.text.encode('utf-8').decode('utf-8'))
@@ -98,9 +108,9 @@ def parse(url):
                             if lastmod >= first and lastmod <= last:
                                 print ('lastmod',lastmod,'blog url:', sub_url)
                                 total_cnt += 1
-                                blogs.add(sub_url.replace('&amp;','&'))
-                                csv_writer.writerow([root_url, sub_url, lastmod])
-                                f.flush()
+                            blogs.add(sub_url.replace('&amp;','&'))
+                            # csv_writer.writerow([root_url, sub_url, lastmod])
+                            # f.flush()
                         except:
                             pass
     except:
@@ -121,11 +131,16 @@ def check_sub_xml(sub_url):
 
     return True
 
+domain_cnt = 0
+
 def find_domain(url):
-    print ('find domain function start', url)
-    global domain_list
+    global domain_list, blogs, start_time, domain_cnt
+
+    delta_time = datetime.datetime.now().replace(microsecond=0)-start_time
+    print ('time = {}, blogs len = {}, external domains = {}, find = {}, blog url = {}'.format(delta_time, len(blogs), len(domain_list), domain_cnt, url))
+
     try:
-        r = requests.get(url, headers=headers, timeout=30)
+        r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
         t = html.fromstring(r.text)
         all_links = t.xpath('//a[contains(@href, "blog")]/@href')
         result = []
@@ -137,47 +152,71 @@ def find_domain(url):
                     _domain_w = _domain.replace('www.', '')
                     if _domain_w not in domain_list:
                         _domain_h = _domain.replace('http://', 'https://').replace('https://', 'http://')
-                        if _domain_h not in domain_list:
+                        if _domain_h not in domain_list and len(_domain_h) < 100:
                             domain_list.append(_domain)
                             q.put(_domain)
                             print ('add domain', _domain)
-
+                            domain_cnt += 1
+                            csv_writer.writerow([_domain])
+                            f.flush()
                 else:
                     _domain_n = _domain.replace('http://', 'http://www.').replace('https://', 'https://www.')
                     if _domain_n not in domain_list:
                         _domain_h = _domain.replace('http://', 'https://').replace('https://', 'http://')
-                        if _domain_h not in domain_list:
+                        if _domain_h not in domain_list and len(_domain_h) < 100:
                             domain_list.append(_domain)
                             q.put(_domain)
                             print ('add domain', _domain)
+                            domain_cnt += 1
+                            csv_writer.writerow([_domain])
+                            f.flush()
 
     except:
         # print (format_exc())
         pass
-    print ('find domain function end', url)
+    # print ('find domain function end', url)
 
 
 def add_domain():
-    global blogs
-    # print ('add domain function start')
-    threads = []
-    for blog_url in blogs:
-        while threading.active_count() > 10:
+    global blogs, domain_list, domain_cnt
+    domain_cnt = 0
+    blog_cnt = 0
+    domain_threads = []
+
+    temp = []
+    for bItem in blogs:
+        if bItem not in temp:
+            temp.append(bItem)
+
+    blogs = temp
+
+    while len(blogs) > 0:
+        blog_url = blogs.pop()
+        while threading.active_count() > thread_limit_numbers:
             sleep(1)
         
-        for tt in threads:
+        for tt in domain_threads:
             if not tt.is_alive():
                 tt.join()
-                threads.remove(tt)
+                domain_threads.remove(tt)
 
-        t = threading.Thread(target=find_domain, args=(blog_url, ))
+        t = threading.Thread(target=find_domain, args=(blog_url,))
         t.daemon = True
-        threads.append(t)
+        domain_threads.append(t)
         t.start()
-        sleep(1)
+        # sleep(1)
 
-    for t in threads:
-        t.join()
+        if (len(blogs) == 0) or (blog_cnt > blog_limit):
+            print('------- EXTERNAL BLOG ----------')
+            break
+
+        if domain_cnt >= external_domain_limit:
+            print('------- EXTERNAL DOMAIN ----------')
+            break
+        blog_cnt += 1
+
+    # for t in domain_threads:
+    #     t.join()
     # print ('add domain function end')
 
 def main():
@@ -186,6 +225,7 @@ def main():
     global first
     global last
     global domain_list
+    global start_time
 
     start_time = datetime.datetime.now().replace(microsecond=0)
     today = date.today()
@@ -198,91 +238,43 @@ def main():
     first = datetime.datetime.strptime(str(first_s), '%Y-%m-%d')
     last = datetime.datetime.strptime(str(last_s), '%Y-%m-%d')
 
-    parser = argparse.ArgumentParser(description="Do something.")
-    parser.add_argument('-m', '--method', type=int, required=False, default=0, help='method for action')
-
-    args = parser.parse_args()
-    # Set config
-    method_flag = args.method
-    if method_flag == 0:
-        try:
-            print('=========================')
-            with open('input.csv') as csvfile:
-                reader = csv.reader(csvfile)
-                for row in reader:
-                    domain = ''.join(row).strip(' /') + '/'
-                    q.put(domain)
-                    domain_list.append(domain)
-        except:
-            print('Please check the Input file. File name must "input.csv".')
-        # domain = 'https://www.merkleinc.com/'
-        # q.put(domain)
-        # domain_list.append(domain)
-        f3 = open('domain_list_{}.csv'.format(start_time), 'w')
-        csv_writer3 = csv.writer(f3)
-
+    print('+++++++++++++++++++++++++')
+    sys_ver = sys.version_info
+    if sys_ver.major == 2:
+        domain = raw_input("Please input the Domain URL (e.g. https://example.com/): ")
     else:
-        print('+++++++++++++++++++++++++')
-        sys_ver = sys.version_info
-        if sys_ver.major == 2:
-            domain = raw_input("Please input the Domain URL (e.g. https://example.com/): ")
-        else:
-            domain = input("Please input the Domain URL (e.g. https://example.com/): ")
+        domain = input("Please input the Domain URL (e.g. https://example.com/): ")
 
-        if 'http' not in domain:
-            print('Domain URL should be contained a protocol (http:// or https://).')
-            return
+    if 'http' not in domain:
+        print('Domain URL should be contained a protocol (http:// or https://).')
+        return
 
-        domain = domain.strip(' /') + '/'
-        q.put(domain)
-        domain_list.append(domain)
-
-        f1 = open('good_domain_{}.csv'.format(start_time), 'w')
-        f2 = open('bad_domain_{}.csv'.format(start_time), 'w')
-        csv_writer1 = csv.writer(f1)
-        csv_writer2 = csv.writer(f2)
-
-    good_domain_cnt = -1
-    bad_domain_cnt = 0
+    domain = domain.strip(' /') + '/'
+    parsed_uri = urlparse(domain)
+    domain = '{uri.scheme}://{uri.netloc}/'.format(uri=parsed_uri)        
+    q.put(domain)
+    domain_list.append(domain)
 
     flag = True
-    xml_urls = ['sitemap.xml', 'blog/sitemap_index.xml', 'sitemap_blog.xml', 'blog/sitemap.xml', 'sitemap-core.xml', 'emea/sitemap-core.xml']
+    xml_urls = ['sitemap.xml', 'sitemap_index.xml', 'blog/sitemap_index.xml', 'sitemap_blog.xml', 'blog/sitemap.xml', 'sitemap-core.xml', 'emea/sitemap-core.xml']
     while not q.empty():
         total_cnt = 0
         blogs = set()
         url = q.get()
         print ("Start URL: ", url)
+
         for xml_url in xml_urls:
             sitemap_xml = url + xml_url
             parse(sitemap_xml)
-
+            
         print ("==================>" , url,  total_cnt)
         if total_cnt >= 8 or flag:
-            if method_flag == 1:
-                csv_writer1.writerow([url, total_cnt])
-                f1.flush()                
-                add_domain()
-            else:
-                csv_writer3.writerow([url, total_cnt])
-                f3.flush()
-
-            good_domain_cnt += 1
+            add_domain()
             flag = False
-        else:           
-            if method_flag == 1:
-                csv_writer2.writerow([url, total_cnt])
-                f2.flush()
-            else:
-                csv_writer3.writerow([url, total_cnt])
-                f3.flush()
-
-            bad_domain_cnt += 1
 
         sleep(1)
-        delta_time = datetime.datetime.now().replace(microsecond=0) - start_time
-        print ("-----------------------------------------------------------------")
-        print('===== >> time : {}, total: {}, good : {}, bad : {}, rest : {} << ====='.format(delta_time, len(domain_list)-1, good_domain_cnt, bad_domain_cnt, q.qsize()))
-        print ("-----------------------------------------------------------------")
 
 if __name__ == '__main__':
     main()
+
+# https://vooozer.com
